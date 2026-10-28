@@ -1,0 +1,332 @@
+
+name: Build pgvector 0.8.7 for PostgreSQL 18 x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 45
+
+    steps:
+      # 1. 从 pgvector 官方仓库检出固定版本源码
+      - name: Checkout official pgvector source
+        uses: actions/checkout@v4
+        with:
+          repository: pgvector/pgvector
+          ref: v0.8.7
+          path: pgvector
+          persist-credentials: false
+
+      # 2. 准备临时测试环境
+      - name: Prepare environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $pgRoot = 'C:\Program Files\PostgreSQL\18'
+          $pgPass = 'PgCi-' + [guid]::NewGuid().ToString('N') + 'Aa1!'
+
+          $envLines = @(
+            "PGROOT=$pgRoot"
+            'PGHOST=127.0.0.1'
+            'PGPORT=5432'
+            'PGUSER=postgres'
+            'PGDATABASE=postgres'
+            "PG_TEST_PASSWORD=$pgPass"
+            "PGPASSWORD=$pgPass"
+          )
+
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::AppendAllText(
+            $env:GITHUB_ENV,
+            (($envLines -join "`n") + "`n"),
+            $utf8
+          )
+
+          [System.IO.File]::AppendAllText(
+            $env:GITHUB_PATH,
+            "$pgRoot\bin`n",
+            $utf8
+          )
+
+      # 3. 下载 EDB 官方 PostgreSQL 18.6-5 安装包并验证 SHA-256
+      - name: Download and verify PostgreSQL 18
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $installer = Join-Path $env:RUNNER_TEMP `
+            'postgresql-18.6-5-windows-x64.exe'
+
+          $url = 'https://get.enterprisedb.com/postgresql/postgresql-18.6-5-windows-x64.exe'
+
+          $expectedHash = '227e2bc08091b4c2b8338c7d61b11d057f895711480b006f90bfcfcd2410a58a'
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $actualHash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          if ($actualHash -ne $expectedHash) {
+            throw "PostgreSQL installer SHA-256 mismatch: $actualHash"
+          }
+
+          Write-Host 'PostgreSQL installer SHA-256 verified.'
+
+          $installerArgs = @(
+            '--mode', 'unattended',
+            '--unattendedmodeui', 'none',
+            '--prefix', $env:PGROOT,
+            '--datadir', "$env:PGROOT\data",
+            '--serverport', '5432',
+            '--superpassword', $env:PG_TEST_PASSWORD,
+            '--servicepassword', $env:PG_TEST_PASSWORD,
+            '--servicename', 'postgresql-x64-18-ci',
+            '--disable-components', 'pgAdmin,stackbuilder'
+          )
+
+          & $installer @installerArgs
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "PostgreSQL installer failed with exit code $LASTEXITCODE"
+          }
+
+      # 4. 启动 PostgreSQL 并等待数据库就绪
+      - name: Start PostgreSQL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $serviceName = 'postgresql-x64-18-ci'
+          $service = Get-Service -Name $serviceName
+
+          if ($service.Status -ne 'Running') {
+            Start-Service -Name $serviceName
+          }
+
+          $readyExe = Join-Path $env:PGROOT 'bin\pg_isready.exe'
+          $ready = $false
+
+          for ($i = 0; $i -lt 60; $i++) {
+            & $readyExe -h $env:PGHOST -p $env:PGPORT -U $env:PGUSER
+
+            if ($LASTEXITCODE -eq 0) {
+              $ready = $true
+              break
+            }
+
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $ready) {
+            throw 'PostgreSQL did not become ready.'
+          }
+
+          & (Join-Path $env:PGROOT 'bin\psql.exe') `
+            -v ON_ERROR_STOP=1 `
+            -c 'SELECT version();'
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Cannot connect to PostgreSQL.'
+          }
+
+      # 5. 使用 MSVC x64 编译并安装 pgvector
+      - name: Build and install pgvector
+        shell: cmd
+        working-directory: pgvector
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+
+          nmake /NOLOGO /F Makefile.win
+          if errorlevel 1 exit /b 1
+
+          nmake /NOLOGO /F Makefile.win install
+          if errorlevel 1 exit /b 1
+
+      # 6. 如果 PostgreSQL 安装包包含 pg_regress，运行完整回归测试
+      - name: Run pgvector regression tests when available
+        shell: cmd
+        working-directory: pgvector
+        run: |
+          if exist "%PGROOT%\lib\pgxs\src\test\regress\pg_regress.exe" (
+            call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+            if errorlevel 1 exit /b 1
+
+            nmake /NOLOGO /F Makefile.win installcheck
+            if errorlevel 1 exit /b 1
+          ) else (
+            echo ::warning::pg_regress is not included; the SQL smoke tests will still run.
+          )
+
+      # 7. 必须执行的 SQL 冒烟测试
+      - name: Test vector operations and HNSW
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $sqlPath = Join-Path $env:RUNNER_TEMP 'pgvector-smoke-test.sql'
+          $psql = Join-Path $env:PGROOT 'bin\psql.exe'
+
+          $sql = @'
+          CREATE EXTENSION IF NOT EXISTS vector;
+
+          DROP TABLE IF EXISTS pgvector_ci_smoke;
+
+          CREATE TABLE pgvector_ci_smoke (
+            id integer PRIMARY KEY,
+            embedding vector(3) NOT NULL
+          );
+
+          INSERT INTO pgvector_ci_smoke (id, embedding)
+          VALUES
+            (1, '[1,2,3]'),
+            (2, '[4,5,6]');
+
+          CREATE INDEX pgvector_ci_smoke_hnsw
+          ON pgvector_ci_smoke
+          USING hnsw (embedding vector_l2_ops);
+
+          DO $check$
+          DECLARE
+            nearest_id integer;
+          BEGIN
+            SELECT id INTO nearest_id
+            FROM pgvector_ci_smoke
+            ORDER BY embedding <-> '[3,1,2]'::vector
+            LIMIT 1;
+
+            IF nearest_id IS DISTINCT FROM 1 THEN
+              RAISE EXCEPTION 'Vector nearest-neighbor test failed';
+            END IF;
+          END
+          $check$;
+
+          DROP TABLE pgvector_ci_smoke;
+
+          SELECT extversion
+          FROM pg_extension
+          WHERE extname = 'vector';
+          '@
+
+          Set-Content -Path $sqlPath -Value $sql -Encoding utf8
+
+          & $psql -v ON_ERROR_STOP=1 -f $sqlPath
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'pgvector SQL smoke test failed.'
+          }
+
+      # 8. 整理可安装的扩展文件
+      - name: Package extension files
+        shell: pwsh
+        working-directory: pgvector
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $dist = Join-Path $env:RUNNER_TEMP 'pgvector-dist'
+          $libDest = Join-Path $dist 'lib'
+          $extDest = Join-Path $dist 'share\extension'
+          $includeDest = Join-Path $dist 'include\server'
+
+          New-Item -ItemType Directory -Force -Path `
+            $libDest, $extDest, $includeDest | Out-Null
+
+          # PostgreSQL 扩展 DLL
+          Copy-Item `
+            (Join-Path $env:PGROOT 'lib\vector.dll') `
+            $libDest -Force
+
+          # 扩展控制文件
+          Copy-Item `
+            (Join-Path $env:PGROOT 'share\extension\vector.control') `
+            $extDest -Force
+
+          # 当前版本 SQL 与所有可用升级脚本
+          Get-ChildItem `
+            (Join-Path $env:PGROOT 'share\extension') `
+            -Filter 'vector*.sql' -File |
+            Copy-Item -Destination $extDest -Force
+
+          # 如果安装目标包含公开头文件，也一并打包
+          foreach ($header in @('halfvec.h', 'sparsevec.h', 'vector.h')) {
+            $source = Join-Path $env:PGROOT "include\server\$header"
+
+            if (Test-Path $source) {
+              Copy-Item $source $includeDest -Force
+            }
+          }
+
+          $sourceCommit = (git rev-parse HEAD).Trim()
+          $dllHash = (Get-FileHash `
+            (Join-Path $libDest 'vector.dll') `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          @"
+          pgvector version: 0.8.7
+          Source repository: https://github.com/pgvector/pgvector
+          Source tag: v0.8.7
+          Source commit: $sourceCommit
+          Target: EDB PostgreSQL 18.6-5 Windows x64
+          Build platform: GitHub Actions windows-2025 / MSVC x64
+          vector.dll SHA-256: $dllHash
+          "@ | Set-Content `
+            -Path (Join-Path $dist 'BUILD-INFO.txt') `
+            -Encoding utf8
+
+          @'
+          pgvector 0.8.7 - PostgreSQL 18 x64
+
+          The artifact root mirrors the PostgreSQL installation root.
+
+          Installation:
+          1. Back up your database.
+          2. Stop the PostgreSQL 18 Windows service.
+          3. Copy the lib, share, and include directories into the
+             target PostgreSQL 18 installation directory.
+          4. Restart PostgreSQL.
+          5. In each database that needs pgvector, run:
+               CREATE EXTENSION vector;
+
+          For an existing installation, inspect the current extension
+          version and available upgrade scripts before running:
+               ALTER EXTENSION vector UPDATE;
+
+          This artifact was built against EDB PostgreSQL 18.6-5 x64.
+          Prefer the same PostgreSQL distribution and architecture.
+          '@ | Set-Content `
+            -Path (Join-Path $dist 'README-INSTALL.txt') `
+            -Encoding utf8
+
+          # 生成文件校验清单，不把清单自身纳入计算
+          $files = Get-ChildItem $dist -Recurse -File |
+            Where-Object { $_.Name -ne 'SHA256SUMS.txt' }
+
+          $hashLines = foreach ($file in $files) {
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $relative = $file.FullName.Substring($dist.Length).TrimStart('\')
+            "$hash  $relative"
+          }
+
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllLines(
+            (Join-Path $dist 'SHA256SUMS.txt'),
+            [string[]]$hashLines,
+            $utf8
+          )
+
+          Get-ChildItem $dist -Recurse -File |
+            Select-Object FullName, Length
+
+      # 9. 上传构建产物
+      - name: Upload pgvector artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgvector-0.8.7-pg18-windows-x64
+          path: ${{ runner.temp }}\pgvector-dist\**
+          if-no-files-found: error
+          retention-days: 14
